@@ -551,24 +551,37 @@ proc rlpxConnect*(myKeys: KeyPair, listenPort: Port,
   var handshake = newHandshake({Initiator})
   handshake.host = myKeys
 
+  # Generate and send Auth Message
   var authMsg: array[AuthMessageMaxEIP8, byte]
   var authMsgLen = 0
   check authMessage(handshake, remote.node.pubkey, authMsg, authMsgLen)
-
   await result.socket.send(addr authMsg[0], authMsgLen)
 
-  var ackMsg = newSeqOfCap[byte](1024)
-  ackMsg.setLen(handshake.expectedLength)
-  await result.socket.fullRecvInto(ackMsg)
-  var ret = handshake.decodeAckMessage(ackMsg)
-  if ret == AuthStatus.IncompleteError:
-    ackMsg.setLen(handshake.expectedLength)
-    await result.socket.fullRecvInto(addr ackMsg[AckMessageV4Length],
-                                     ackMsg.len - AckMessageV4Length)
-    ret = handshake.decodeAckMessage(ackMsg)
-  check ret
+  # Receive and check Ack Message
+  var ackMsg = newSeq[byte](handshake.expectedLength * 2)
+  var rlength = len(ackMsg)
+  var rindex = 0
+  while true:
+    var count = await recvInto(result.socket, addr ackMsg[rindex], rlength)
+    if count == 0:
+      raise newException(Exception, "Error: Peer disconnected!")
+    else:
+      rindex += count
+      var ret = handshake.decodeAckMessage(ackMsg.toOpenArray(0, rindex - 1))
+      if ret == AuthStatus.IncompleteError:
+        if handshake.expectedLength > len(ackMsg):
+          ackMsg.setLen(handshake.expectedLength)
+          rlength = len(ackMsg) - rindex
+        else:
+          rlength -= count
+        continue
+      elif ret == AuthStatus.Success:
+        ackMsg.setLen(rindex)
+        break
+      else:
+        raise newException(Exception, "Error: " & $ret)
 
-  initSecretState(handshake, ^authMsg, ^ackMsg, result)
+  initSecretState(handshake, ^authMsg, ackMsg, result)
 
   if handshake.remoteHPubkey != remote.node.pubKey:
     raise newException(Exception, "Remote pubkey is wrong")
@@ -590,29 +603,41 @@ proc rlpxConnectIncoming*(myKeys: KeyPair, listenPort: Port, address: IpAddress,
   var handshake = newHandshake({Responder})
   handshake.host = myKeys
 
-  var authMsg = newSeqOfCap[byte](1024)
-  authMsg.setLen(handshake.expectedLength)
+  # Receive and check Auth Message
+  var authMsg = newSeq[byte](handshake.expectedLength * 2)
+  var rlength = len(authMsg)
+  var rindex = 0
+  while true:
+    var count = await recvInto(result.socket, addr authMsg[rindex], rlength)
+    if count == 0:
+      raise newException(Exception, "Error: Peer disconnected!")
+    else:
+      rindex += count
+      var ret = handshake.decodeAckMessage(authMsg.toOpenArray(0, rindex - 1))
+      if ret == AuthStatus.IncompleteError:
+        if handshake.expectedLength > len(authMsg):
+          authMsg.setLen(handshake.expectedLength)
+          rlength = len(authMsg) - rindex
+        else:
+          rlength -= count
+        continue
+      elif ret == AuthStatus.Success:
+        authMsg.setLen(rindex)
+        break
+      else:
+        raise newException(Exception, "Error: " & $ret)
 
-  await s.fullRecvInto(authMsg)
-  var ret = handshake.decodeAuthMessage(authMsg)
-  if ret == AuthStatus.IncompleteError: # Eip8 auth message is likely
-    authMsg.setLen(handshake.expectedLength)
-    await s.fullRecvInto(addr authMsg[AuthMessageV4Length],
-                         authMsg.len - AuthMessageV4Length)
-    ret = handshake.decodeAuthMessage(authMsg)
-
-  check ret
-
+  # Generate and send Ack Message
   var ackMsg: array[AckMessageMaxEIP8, byte]
   var ackMsgLen: int
   check handshake.ackMessage(ackMsg, ackMsgLen)
-
   await s.send(addr ackMsg[0], ackMsgLen)
+
   initSecretState(handshake, authMsg, ^ackMsg, result)
 
   var response = await result.nextMsg(p2p.hello, discardOthers = true)
   discard result.hello(baseProtocolVersion, clienId,
-                     gCapabilities, listenPort.uint, myKeys.pubkey.getRaw())
+                       gCapabilities, listenPort.uint, myKeys.pubkey.getRaw())
 
   if validatePubKeyInHello(response, handshake.remoteHPubkey):
     warn "Remote nodeId is not its public key" # XXX: Do we care?
